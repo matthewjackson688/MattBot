@@ -1,140 +1,121 @@
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
+const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
 const axios = require('axios');
-const { Client, Collection, GatewayIntentBits, Events } = require('discord.js');
 
-/* --------------------
-   Discord Client
--------------------- */
+// --------------------
+// CONFIG
+// --------------------
+const SHEETDB_URL = process.env.SHEETDB_URL; // e.g., 'https://sheetdb.io/api/v1/my6bx0lb6c50k'
+const DONE_COLUMN = "Done"; // Tickbox column in Sheet
+const TIMESTAMP_COLUMN = "Done Timestamp"; // Column to store Done timestamp
+
+// --------------------
+// Discord Client Setup
+// --------------------
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildMessageReactions,
         GatewayIntentBits.MessageContent
-    ]
+    ],
+    partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-/* --------------------
-   Express Webhook Server
--------------------- */
-const app = express();
-app.use(express.json());
+// --------------------
+// Helper: Format timestamp dd/MM/yyyy HH:mm
+// --------------------
+function formatTimestamp(date) {
+    const pad = (n) => n.toString().padStart(2, '0');
+    const day = pad(date.getUTCDate());
+    const month = pad(date.getUTCMonth() + 1);
+    const year = date.getUTCFullYear();
+    const hours = pad(date.getUTCHours());
+    const minutes = pad(date.getUTCMinutes());
+    return `${day}/${month}/${year} ${hours}:${minutes}`;
+}
 
-const PORT = process.env.PORT || 3000;
-const MONITORED_CHANNEL_ID = process.env.MONITORED_CHANNEL_ID;
-const SHEETDB_URL = process.env.SHEETDB_URL;
+// --------------------
+// Helper: Update SheetDB
+// --------------------
+async function updateDone(rowId, done) {
+    try {
+        const timestamp = done ? formatTimestamp(new Date()) : "";
+        const data = {
+            data: [
+                { 
+                    [DONE_COLUMN]: done, 
+                    [TIMESTAMP_COLUMN]: timestamp
+                }
+            ]
+        };
 
-/* --------------------
-   Slash Commands
--------------------- */
-client.commands = new Collection();
-const commandsPath = path.join(__dirname, 'commands');
-
-if (fs.existsSync(commandsPath)) {
-    const commandFiles = fs.readdirSync(commandsPath).filter(f => f.endsWith('.js'));
-    for (const file of commandFiles) {
-        const command = require(path.join(commandsPath, file));
-        if (command.data && command.execute) {
-            client.commands.set(command.data.name, command);
-        }
+        // Update by unique ID column (assume column A = "ID")
+        await axios.put(`${SHEETDB_URL}/ID/${rowId}`, data);
+        console.log(`✅ Row ${rowId} set Done=${done} Timestamp='${timestamp}'`);
+    } catch (err) {
+        console.error('❌ Error updating Sheet:', err.response?.data || err.message || err);
     }
 }
 
-/* --------------------
-   Ready
--------------------- */
+// --------------------
+// Reaction Added
+// --------------------
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+    if (user.bot) return;
+
+    try {
+        if (reaction.partial) await reaction.fetch();
+        if (reaction.message.partial) await reaction.message.fetch();
+
+        const embed = reaction.message.embeds[0];
+        if (!embed) return;
+
+        const rowField = embed.fields?.find(f => f.name === "🆔 Row ID");
+        if (!rowField) return;
+
+        const rowId = rowField.value;
+        if (!rowId) return;
+
+        await updateDone(rowId, true);
+    } catch (err) {
+        console.error('❌ Reaction add handler error:', err);
+    }
+});
+
+// --------------------
+// Reaction Removed
+// --------------------
+client.on(Events.MessageReactionRemove, async (reaction, user) => {
+    if (user.bot) return;
+
+    try {
+        if (reaction.partial) await reaction.fetch();
+        if (reaction.message.partial) await reaction.message.fetch();
+
+        const embed = reaction.message.embeds[0];
+        if (!embed) return;
+
+        const rowField = embed.fields?.find(f => f.name === "🆔 Row ID");
+        if (!rowField) return;
+
+        const rowId = rowField.value;
+        if (!rowId) return;
+
+        await updateDone(rowId, false);
+    } catch (err) {
+        console.error('❌ Reaction remove handler error:', err);
+    }
+});
+
+// --------------------
+// Ready Event
+// --------------------
 client.once(Events.ClientReady, () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
-/* --------------------
-   Slash Command Handler
--------------------- */
-client.on(Events.InteractionCreate, async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-    const command = client.commands.get(interaction.commandName);
-    if (!command) return;
-    await command.execute(interaction);
-});
-
-/* --------------------
-   Message Monitor
--------------------- */
-client.on(Events.MessageCreate, async message => {
-    if (message.author.id === client.user.id) return;
-
-    if (message.channel.id === MONITORED_CHANNEL_ID) {
-        console.log('📩 Message in monitored channel:', {
-            author: message.author.tag,
-            content: message.content,
-            embeds: message.embeds.length,
-            timestamp: new Date().toISOString()
-        });
-
-        // Ping Guardian on any message
-        await message.channel.send('<@1457521998648574083>');
-    }
-});
-
-/* --------------------
-   Formcord Webhook
--------------------- */
-app.post('/formcord', async (req, res) => {
-    try {
-        console.log('📨 Formcord payload received:', req.body);
-
-        const {
-            "Game Username": username,
-            "Coords": rawCoords,
-            "Title": title
-        } = req.body;
-
-        if (!username) {
-            return res.status(400).send('Missing username');
-        }
-
-        const coords = (rawCoords || '').replace(/[-,]/g, ':');
-
-        const now = new Date();
-        const day = now.toLocaleDateString('en-GB');
-        const timeUTC = now.toISOString().slice(11, 16);
-
-        const sheetData = {
-            data: [{
-                Day: day,
-                "Time (UTC)": timeUTC,
-                "Reservations (UTC)": '',
-                Alliance: '',
-                Username: username,
-                Coords: coords,
-                Title: title || '',
-                Guardian: '',
-                Done: '',
-                "Set title": ''
-            }]
-        };
-
-        await axios.post(SHEETDB_URL, sheetData);
-
-        // Notify Discord channel
-        const channel = await client.channels.fetch(MONITORED_CHANNEL_ID);
-        await channel.send(`📋 New reservation received for **${username}** @Guardian`);
-
-        res.status(200).send('OK');
-
-    } catch (err) {
-        console.error('❌ Webhook error:', err);
-        res.status(500).send('Server error');
-    }
-});
-
-/* --------------------
-   Start Servers
--------------------- */
-app.listen(PORT, () => {
-    console.log(`🚀 Webhook server running on port ${PORT}`);
-});
-
+// --------------------
+// Login
+// --------------------
 client.login(process.env.DISCORD_TOKEN);
